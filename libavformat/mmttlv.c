@@ -190,6 +190,93 @@ static int mmttlv_read_compressed_ip_packet(
     return ff_mmtp_parse_packet(program->mmtp, s, pkt, buf, size);
 }
 
+// A byte immediately following a sync byte is only plausibly a TLV
+// packet_type if it is one of the defined values below. Requiring this at
+// every candidate sync point (both the initial and the lookahead one)
+// considerably reduces the odds of locking onto a coincidental 0x7F byte
+// inside otherwise-arbitrary (e.g. compressed video) packet payload data.
+static int mmttlv_valid_packet_type(uint8_t type)
+{
+    switch (type) {
+    case UNDEFINED_PACKET:
+    case IPV4_PACKET:
+    case IPV6_PACKET:
+    case HEADER_COMPRESSED_IP_PACKET:
+    case TRANSMISSION_CONTROL_PACKET:
+    case NULL_PACKET:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Resynchronize to a TLV packet boundary by scanning for a sync byte
+// (HEADER_BYTE) followed by a plausible packet_type, whose declared length
+// leads to another such sync byte + packet_type pair. This is retried
+// whenever synchronization is lost, not just once after a seek, since a
+// live, variable-length-packet stream can be joined mid-packet at any byte
+// offset and a single false lock would otherwise corrupt all further
+// parsing with no way to recover.
+static int mmttlv_resync(AVFormatContext *s, struct MMTTLVContext *ctx)
+{
+    uint8_t header[4];
+    uint16_t size;
+    int err;
+    int64_t pos = avio_tell(s->pb);
+
+    if (pos < 0) return (int) pos;
+    ctx->last_pos = pos;
+
+    while (pos - ctx->last_pos < ctx->resync_size) {
+        if ((err = ffio_ensure_seekback(s->pb, 4)) < 0)
+            return err;
+
+        if ((err = avio_read(s->pb, header, 4)) < 0)
+            return avio_feof(s->pb) ? AVERROR_EOF : err;
+
+        if (header[0] != HEADER_BYTE || !mmttlv_valid_packet_type(header[1])) {
+            if ((pos = avio_seek(s->pb, -3, SEEK_CUR)) < 0)
+                return (int) pos;
+            continue;
+        }
+
+        size = AV_RB16(header + 2);
+
+        if ((pos = avio_seek(s->pb, -4, SEEK_CUR)) < 0)
+            return (int) pos;
+
+        if ((err = ffio_ensure_seekback(s->pb, 4 + size + 2)) < 0)
+            return err;
+
+        if ((pos = avio_skip(s->pb, 4 + size)) < 0)
+            return (int) pos;
+
+        if ((err = avio_read(s->pb, header, 2)) < 0)
+            return avio_feof(s->pb) ? AVERROR_EOF : err;
+
+        if (header[0] == HEADER_BYTE && mmttlv_valid_packet_type(header[1])) {
+            // found HEADER, [size], HEADER, packet_type, should be good
+            if ((pos = avio_seek(
+                s->pb, -(int64_t) (size) - 2 - 4, SEEK_CUR)) < 0)
+                return (int) pos;
+            goto success;
+        }
+
+        if ((pos = avio_seek(
+            s->pb, -(int64_t) (size) - 2 - 3, SEEK_CUR)) < 0)
+            return (int) pos;
+    }
+    return AVERROR_INVALIDDATA;
+
+    success:
+    ctx->last_pos = pos;
+
+    for (struct Program *program = ctx->programs;
+         program != NULL; program = program->next)
+        ff_mmtp_reset_state(program->mmtp);
+    return 0;
+}
+
 static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     uint8_t              header[4];
@@ -200,55 +287,8 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (pos < 0) return (int) pos;
     if (pos != ctx->last_pos) {
-        ctx->last_pos = pos;
-
-        while (pos - ctx->last_pos < ctx->resync_size) {
-            if ((err = ffio_ensure_seekback(s->pb, 4)) < 0)
-                return err;
-
-            if ((err = avio_read(s->pb, header, 4)) < 0)
-                return avio_feof(s->pb) ? AVERROR_EOF : err;
-
-            if (header[0] != HEADER_BYTE) {
-                if ((pos = avio_seek(s->pb, -3, SEEK_CUR)) < 0)
-                    return (int) pos;
-                continue;
-            }
-
-            size = AV_RB16(header + 2);
-
-            if ((pos = avio_seek(s->pb, -4, SEEK_CUR)) < 0)
-                return (int) pos;
-
-            if ((err = ffio_ensure_seekback(s->pb, 4 + size + 1)) < 0)
-                return err;
-
-            if ((pos = avio_skip(s->pb, 4 + size)) < 0)
-                return (int) pos;
-
-            if ((err = avio_read(s->pb, header, 1)) < 0)
-                return avio_feof(s->pb) ? AVERROR_EOF : err;
-
-            if (header[0] == HEADER_BYTE) {
-                // found HEADER, [size], HEADER, should be good
-                if ((pos = avio_seek(
-                    s->pb, -(int64_t) (size) - 1 - 4, SEEK_CUR)) < 0)
-                    return (int) pos;
-                goto success;
-            }
-
-            if ((pos = avio_seek(
-                s->pb, -(int64_t) (size) - 1 - 3, SEEK_CUR)) < 0)
-                return (int) pos;
-        }
-        return AVERROR_INVALIDDATA;
-
-        success:
-        ctx->last_pos = pos;
-
-        for (struct Program *program = ctx->programs;
-             program != NULL; program = program->next)
-            ff_mmtp_reset_state(program->mmtp);
+        if ((err = mmttlv_resync(s, ctx)) < 0)
+            return err;
     }
 
     if (pkt != NULL) pkt->pos = ctx->last_pos;
@@ -256,8 +296,21 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
         return avio_feof(s->pb) ? AVERROR_EOF : err;
     ctx->last_pos += 4;
 
-    if (header[0] != HEADER_BYTE)
-        return AVERROR_INVALIDDATA;
+    if (header[0] != HEADER_BYTE || !mmttlv_valid_packet_type(header[1])) {
+        // Lost synchronization mid-stream (e.g. a corrupted or dropped
+        // packet threw off the byte offset). Rather than failing the whole
+        // demux outright, try to reacquire sync from here, same as we do
+        // right after opening/seeking.
+        if ((pos = avio_seek(s->pb, -4, SEEK_CUR)) < 0)
+            return (int) pos;
+        if ((err = mmttlv_resync(s, ctx)) < 0)
+            return err;
+        if ((err = ffio_read_size(s->pb, header, 4)) < 0)
+            return avio_feof(s->pb) ? AVERROR_EOF : err;
+        ctx->last_pos += 4;
+        if (header[0] != HEADER_BYTE || !mmttlv_valid_packet_type(header[1]))
+            return AVERROR_INVALIDDATA;
+    }
 
     size = AV_RB16(header + 2);
     if (header[1] == NULL_PACKET) {
