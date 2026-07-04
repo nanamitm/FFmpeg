@@ -1407,14 +1407,20 @@ emit_packet(MMTPContext *ctx, struct Streams *st, uint8_t *data, int size)
 
     if (st->parser == NULL) {
         st->parser = av_parser_init(st->stream->codecpar->codec_id);
-        if (st->parser == NULL) return AVERROR(ENOMEM);
+        if (st->parser == NULL) {
+            av_log(ctx->s, AV_LOG_WARNING, "[diag] emit_packet: av_parser_init(codec_id=%d) returned NULL\n",
+                   st->stream->codecpar->codec_id);
+            return AVERROR(ENOMEM);
+        }
         st->parser->last_pos = 0;
     }
 
     while (size > 0) {
         if (st->parser->fetch_timestamp) {
-            if ((err = fill_pts_dts(st)) < 0)
+            if ((err = fill_pts_dts(st)) < 0) {
+                av_log(ctx->s, AV_LOG_WARNING, "[diag] emit_packet: fill_pts_dts failed err=%d\n", err);
                 return err;
+            }
             st->parser->fetch_timestamp = false;
             st->parser->pos             = st->offset;
             // use last_pos to store flags
@@ -1428,6 +1434,9 @@ emit_packet(MMTPContext *ctx, struct Streams *st, uint8_t *data, int size)
             &out_data, &out_size,
             data, size
         );
+        av_log(ctx->s, AV_LOG_WARNING,
+               "[diag] emit_packet: parser_parse consumed=%d size_before=%d out_size=%d out_data=%p\n",
+               consumed, size, out_size, (const void *)out_data);
         size -= consumed;
 
         if (out_data == NULL) {
@@ -1439,8 +1448,10 @@ emit_packet(MMTPContext *ctx, struct Streams *st, uint8_t *data, int size)
         ctx->pkt->data = (uint8_t *) out_data;
         ctx->pkt->size = out_size;
 
-        if ((err = av_packet_make_refcounted(ctx->pkt)) < 0)
+        if ((err = av_packet_make_refcounted(ctx->pkt)) < 0) {
+            av_log(ctx->s, AV_LOG_WARNING, "[diag] emit_packet: av_packet_make_refcounted failed err=%d\n", err);
             return err;
+        }
 
         ctx->pkt->pos          = st->parser->pos;
         ctx->pkt->pts          = st->parser->pts;
@@ -1460,6 +1471,11 @@ static int consume_mfu(MMTPContext *ctx, GetByteContext *gbc)
     unsigned int   size;
     struct Streams *st = find_current_stream(ctx);
     av_assert0(st != NULL);
+
+    av_log(ctx->s, AV_LOG_WARNING,
+           "[diag] consume_mfu: pid=0x%x codec_id=%d (HEVC=%d AAC_LATM=%d TTML=%d NONE=%d)\n",
+           ctx->current_pid, st->stream->codecpar->codec_id,
+           AV_CODEC_ID_HEVC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_TTML, AV_CODEC_ID_NONE);
 
     switch (st->stream->codecpar->codec_id) {
     case AV_CODEC_ID_HEVC:
@@ -1695,7 +1711,12 @@ int ff_mmtp_parse_packet(MMTPContext *ctx, AVFormatContext *s, AVPacket *pkt,
         err = parse_signalling_messages(ctx, packet_sequence_number, &gbc);
         break;
     }
-    if (err < 0) return err;
+    if (err < 0) {
+        av_log(s, AV_LOG_WARNING,
+               "[diag] ff_mmtp_parse_packet: payload_type=0x%x pid=0x%x pkt=%p err=%d\n",
+               payload_type, ctx->current_pid, (void *)pkt, err);
+        return err;
+    }
     return (pkt == NULL || pkt->data != NULL) ? 0 : FFERROR_REDO;
 }
 
