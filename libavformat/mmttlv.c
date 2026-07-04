@@ -197,7 +197,8 @@ static int mmttlv_read_compressed_ip_packet(
     {
         int err = ff_mmtp_parse_packet(program->mmtp, s, pkt, buf, size);
         if (err < 0)
-            av_log(s, AV_LOG_WARNING, "[diag] cip: ff_mmtp_parse_packet failed err=%d\n", err);
+            av_log(s, AV_LOG_WARNING, "[diag] cip: ff_mmtp_parse_packet failed err=%d (%s)\n",
+                   err, av_err2str(err));
         return err;
     }
 }
@@ -379,7 +380,12 @@ static int mmttlv_read_header(AVFormatContext *s)
     while (s->nb_streams <= 0 && allow > 0) {
         const int64_t cur = ctx->last_pos;
         const int     err = mmttlv_read_packet(s, NULL);
-        if (err < 0) return err;
+        // FFERROR_REDO just means "no output from this call, try again",
+        // e.g. because fill_pts_dts() isn't ready to timestamp an audio/
+        // video unit yet. It is not a real failure (see how
+        // mmttlv_read_timestamp() already treats it below) and must not
+        // abort this stream-discovery pre-scan.
+        if (err < 0 && err != FFERROR_REDO) return err;
         allow -= ctx->last_pos - cur;
     }
 
