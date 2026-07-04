@@ -761,10 +761,16 @@ static int parse_mmt_package_table(MMTPContext *ctx, GetByteContext *gbc)
 {
     uint16_t length;
 
-    if (bytestream2_get_bytes_left(gbc) < (8 + 8 + 16) / 8)
+    av_log(ctx->s, AV_LOG_WARNING, "[diag] parse_mmt_package_table entered\n");
+
+    if (bytestream2_get_bytes_left(gbc) < (8 + 8 + 16) / 8) {
+        av_log(ctx->s, AV_LOG_WARNING, "[diag] MPT: not enough bytes for header\n");
         return AVERROR_INVALIDDATA;
-    if (bytestream2_get_byteu(gbc) != MMT_PACKAGE_TABLE_ID)
+    }
+    if (bytestream2_get_byteu(gbc) != MMT_PACKAGE_TABLE_ID) {
+        av_log(ctx->s, AV_LOG_WARNING, "[diag] MPT: bad table id\n");
         return AVERROR_INVALIDDATA;
+    }
     // skip: version
     bytestream2_skipu(gbc, 1);
     length = bytestream2_get_be16u(gbc);
@@ -835,12 +841,20 @@ static int parse_mmt_package_table(MMTPContext *ctx, GetByteContext *gbc)
 
             switch (asset_type) {
             case MKTAG('h', 'e', 'v', '1'):
-                if (info.location_type != 0x00) return AVERROR_PATCHWELCOME;
+                if (info.location_type != 0x00) {
+                    av_log(ctx->s, AV_LOG_WARNING,
+                           "[diag] MPT: hev1 asset with unsupported location_type=%d\n",
+                           info.location_type);
+                    return AVERROR_PATCHWELCOME;
+                }
                 stream = find_or_allocate_stream(ctx, info.type0.packet_id);
                 if (stream == NULL) return AVERROR(ENOMEM);
                 stream->stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
                 stream->stream->codecpar->codec_id   = AV_CODEC_ID_HEVC;
                 stream->stream->codecpar->codec_tag  = asset_type;
+                av_log(ctx->s, AV_LOG_WARNING,
+                       "[diag] MPT: registered HEVC stream, packet_id=0x%x\n",
+                       info.type0.packet_id);
                 break;
             case MKTAG('m', 'p', '4', 'a'):
                 if (info.location_type != 0x00) return AVERROR_PATCHWELCOME;
@@ -881,6 +895,8 @@ static int parse_mmt_package_table(MMTPContext *ctx, GetByteContext *gbc)
     }
     bytestream2_skipu(gbc, length);
 
+    av_log(ctx->s, AV_LOG_WARNING, "[diag] parse_mmt_package_table done, nb_streams=%d\n",
+           ctx->s->nb_streams);
     return 0;
 }
 
@@ -1152,36 +1168,56 @@ static int assemble_fragment(
 
     switch (indicator) {
     case NOT_FRAGMENTED:
-        if (ctx->state == IN_FRAGMENT) return AVERROR_INVALIDDATA;
+        if (ctx->state == IN_FRAGMENT) {
+            av_log(opaque->s, AV_LOG_WARNING,
+                   "[diag] assemble_fragment: NOT_FRAGMENTED while IN_FRAGMENT\n");
+            return AVERROR_INVALIDDATA;
+        }
         ctx->state = NOT_STARTED;
         bytestream2_init(&gbc, data, size);
         return parser(opaque, &gbc);
     case FIRST_FRAGMENT:
-        if (ctx->state == IN_FRAGMENT) return AVERROR_INVALIDDATA;
+        if (ctx->state == IN_FRAGMENT) {
+            av_log(opaque->s, AV_LOG_WARNING,
+                   "[diag] assemble_fragment: FIRST_FRAGMENT while IN_FRAGMENT\n");
+            return AVERROR_INVALIDDATA;
+        }
         ctx->state = IN_FRAGMENT;
         return append_data(ctx, data, size);
     case MIDDLE_FRAGMENT:
         if (ctx->state == SKIP) {
-            av_log(opaque->s, AV_LOG_VERBOSE, "Drop packet %u\n", seq_num);
+            av_log(opaque->s, AV_LOG_WARNING, "[diag] Drop packet %u (MIDDLE, state=SKIP)\n", seq_num);
             return 0;
         }
-        if (ctx->state != IN_FRAGMENT) return AVERROR_INVALIDDATA;
+        if (ctx->state != IN_FRAGMENT) {
+            av_log(opaque->s, AV_LOG_WARNING,
+                   "[diag] assemble_fragment: MIDDLE_FRAGMENT while state=%d\n", ctx->state);
+            return AVERROR_INVALIDDATA;
+        }
         return append_data(ctx, data, size);
     case LAST_FRAGMENT:
         if (ctx->state == SKIP) {
-            av_log(opaque->s, AV_LOG_VERBOSE, "Drop packet %u\n", seq_num);
+            av_log(opaque->s, AV_LOG_WARNING, "[diag] Drop packet %u (LAST, state=SKIP)\n", seq_num);
             return 0;
         }
-        if (ctx->state != IN_FRAGMENT) return AVERROR_INVALIDDATA;
+        if (ctx->state != IN_FRAGMENT) {
+            av_log(opaque->s, AV_LOG_WARNING,
+                   "[diag] assemble_fragment: LAST_FRAGMENT while state=%d\n", ctx->state);
+            return AVERROR_INVALIDDATA;
+        }
         if ((err = append_data(ctx, data, size)) < 0) return err;
 
         bytestream2_init(&gbc, ctx->data, ctx->size);
         err = parser(opaque, &gbc);
+        if (err < 0)
+            av_log(opaque->s, AV_LOG_WARNING,
+                   "[diag] assemble_fragment: parser callback failed err=%d size=%zu\n", err, ctx->size);
 
         ctx->size  = 0;
         ctx->state = NOT_STARTED;
         return err;
     default:
+        av_log(opaque->s, AV_LOG_WARNING, "[diag] assemble_fragment: unknown indicator=%d\n", indicator);
         return AVERROR_INVALIDDATA;
     }
 }
@@ -1428,7 +1464,12 @@ static int consume_mfu(MMTPContext *ctx, GetByteContext *gbc)
     switch (st->stream->codecpar->codec_id) {
     case AV_CODEC_ID_HEVC:
         size = bytestream2_get_be32(gbc);
-        if (size != bytestream2_get_bytes_left(gbc)) return AVERROR_INVALIDDATA;
+        if (size != bytestream2_get_bytes_left(gbc)) {
+            av_log(ctx->s, AV_LOG_WARNING,
+                   "[diag] consume_mfu HEVC size mismatch: declared=%u left=%d\n",
+                   size, bytestream2_get_bytes_left(gbc));
+            return AVERROR_INVALIDDATA;
+        }
         if ((buf = av_malloc(size + 3)) == NULL) return AVERROR(ENOMEM);
         buf[0] = 0x00;
         buf[1] = 0x00;
