@@ -49,44 +49,41 @@ enum {
 
 static int mmttlv_probe(const AVProbeData *p)
 {
-    size_t   i, j;
+    size_t   i;
     uint8_t  packet_type;
     uint16_t data_length;
 
     int processed  = 0;
     int recognized = 0;
 
+    // Since we always join a live stream mid-packet, the first bytes we see
+    // are effectively arbitrary (e.g. compressed video payload) until we
+    // happen upon the real packet boundary. Any 0x7F byte within that
+    // otherwise-arbitrary data is a candidate "false" sync point; if we
+    // don't recognize *and skip past* those quickly, we can burn our whole
+    // scan budget (processed < 100) rescanning garbage overlapping bytes one
+    // at a time without ever reaching a real, well-formed packet, yielding
+    // an unfairly (and sometimes fatally) low score. So: any sync byte
+    // followed by a plausible packet_type is treated as recognized and
+    // fully skipped via its declared length, regardless of deeper
+    // per-type validity (e.g. compressed-IP context identification) which
+    // isn't needed just to establish confidence that this is TLV data.
     for (i = 0; i + 4 < p->buf_size && processed < 100;) {
         if (p->buf[i] != HEADER_BYTE) {
             ++i;
             continue;
         }
-        ++processed;
 
         packet_type = p->buf[i + 1];
-        data_length = AV_RB16(p->buf + i + 2);
-        i += 4;
-
-        if (packet_type == HEADER_COMPRESSED_IP_PACKET) {
-            if (data_length < 3 || i + 2 >= p->buf_size) goto skip;
-            switch (p->buf[i + 2]) {
-            case CONTEXT_IDENTIFICATION_PARTIAL_IPV4_AND_PARTIAL_UDP_HEADER:
-            case CONTEXT_IDENTIFICATION_IPV4_HEADER:
-            case CONTEXT_IDENTIFICATION_PARTIAL_IPV6_AND_PARTIAL_UDP_HEADER:
-            case CONTEXT_IDENTIFICATION_NO_COMPRESSED_HEADER:
-                ++recognized;
-                i += data_length;
-            }
-        } else if (packet_type == NULL_PACKET) {
-            // null packets should contain all 0xFFs
-            for (j = i; j < i + data_length && j < p->buf_size; ++j) {
-                if (p->buf[j] != 0xFF) goto skip;
-            }
-            ++recognized;
-            i += data_length;
+        if (packet_type > 0x04 && packet_type < 0xFD) {
+            ++i;
+            continue;
         }
+        ++processed;
 
-        skip:;
+        data_length = AV_RB16(p->buf + i + 2);
+        ++recognized;
+        i += 4 + data_length;
     }
 
     return recognized * AVPROBE_SCORE_MAX / FFMAX(processed, 10);
