@@ -146,10 +146,8 @@ static int mmttlv_read_compressed_ip_packet(
     uint32_t       context_id;
     struct Program *program;
 
-    if (size < 3) {
-        av_log(s, AV_LOG_WARNING, "[diag] cip: size<3 (%u)\n", size);
+    if (size < 3)
         return AVERROR_INVALIDDATA;
-    }
     context_id = AV_RB16(buf) >> 4;
     buf += 3;
     size -= 3;
@@ -171,36 +169,22 @@ static int mmttlv_read_compressed_ip_packet(
         program->cid  = context_id;
     }
 
-    av_log(s, AV_LOG_WARNING,
-           "[diag] cip: context_id=0x%x header_type=0x%x size=%u\n",
-           context_id, buf[-1], size);
-
     switch (buf[-1]) {
     case CONTEXT_IDENTIFICATION_PARTIAL_IPV4_AND_PARTIAL_UDP_HEADER:
     case CONTEXT_IDENTIFICATION_IPV4_HEADER:
-        av_log(s, AV_LOG_WARNING, "[diag] cip: IPv4 header compression unimplemented\n");
         return AVERROR_PATCHWELCOME;
     case CONTEXT_IDENTIFICATION_PARTIAL_IPV6_AND_PARTIAL_UDP_HEADER:
-        if (size < PARTIAL_IPV6_HEADER_LENGTH + PARTIAL_UDP_HEADER_LENGTH) {
-            av_log(s, AV_LOG_WARNING, "[diag] cip: too small for partial ipv6+udp (%u)\n", size);
+        if (size < PARTIAL_IPV6_HEADER_LENGTH + PARTIAL_UDP_HEADER_LENGTH)
             return AVERROR_INVALIDDATA;
-        }
         size -= PARTIAL_IPV6_HEADER_LENGTH + PARTIAL_UDP_HEADER_LENGTH;
         buf += PARTIAL_IPV6_HEADER_LENGTH + PARTIAL_UDP_HEADER_LENGTH;
     case CONTEXT_IDENTIFICATION_NO_COMPRESSED_HEADER:
         break;
     default:
-        av_log(s, AV_LOG_WARNING, "[diag] cip: unknown header_type=0x%x\n", buf[-1]);
         return AVERROR_INVALIDDATA;
     }
 
-    {
-        int err = ff_mmtp_parse_packet(program->mmtp, s, pkt, buf, size);
-        if (err < 0)
-            av_log(s, AV_LOG_WARNING, "[diag] cip: ff_mmtp_parse_packet failed err=%d (%s)\n",
-                   err, av_err2str(err));
-        return err;
-    }
+    return ff_mmtp_parse_packet(program->mmtp, s, pkt, buf, size);
 }
 
 // A byte immediately following a sync byte is only plausibly a TLV
@@ -279,8 +263,6 @@ static int mmttlv_resync(AVFormatContext *s, struct MMTTLVContext *ctx)
             s->pb, -(int64_t) (size) - 2 - 3, SEEK_CUR)) < 0)
             return (int) pos;
     }
-    av_log(s, AV_LOG_WARNING, "[diag] resync: exhausted resync_size=%zu without finding sync\n",
-           ctx->resync_size);
     return AVERROR_INVALIDDATA;
 
     success:
@@ -323,10 +305,8 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
         if ((err = ffio_read_size(s->pb, header, 4)) < 0)
             return avio_feof(s->pb) ? AVERROR_EOF : err;
         ctx->last_pos += 4;
-        if (header[0] != HEADER_BYTE || !mmttlv_valid_packet_type(header[1])) {
-            av_log(s, AV_LOG_WARNING, "[diag] read_packet: resync failed to reacquire sync\n");
+        if (header[0] != HEADER_BYTE || !mmttlv_valid_packet_type(header[1]))
             return AVERROR_INVALIDDATA;
-        }
     }
 
     size = AV_RB16(header + 2);
@@ -351,8 +331,6 @@ static int mmttlv_read_packet(AVFormatContext *s, AVPacket *pkt)
     case HEADER_COMPRESSED_IP_PACKET:
         return mmttlv_read_compressed_ip_packet(ctx, s, pkt, ctx->buf, size);
     default:
-        av_log(s, AV_LOG_WARNING, "[diag] read_packet: unhandled tlv type=0x%x size=%u\n",
-               header[1], size);
         return AVERROR_PATCHWELCOME;
     }
 }
